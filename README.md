@@ -36,16 +36,17 @@ diskdust ~/.cache --min-size 100MB  # focus on a specific directory
 | `--sort` | size | Sort by `size` or `accessed` (largest or least recently accessed first). |
 | `--top` | 40 | Number of results to show. |
 | `--workers` | CPU count | Parallel workers for the filesystem walk. |
+| `--apparent-size` | false | Use apparent file size instead of actual disk block usage. |
 
 ## How it works
 
-Walks the filesystem in parallel using raw Linux syscalls. A home directory with ~14 million files scans in ~5s with warm disk cache, ~18s with cold.
+Walks the filesystem in parallel using raw OS syscalls (`getattrlistbulk` on macOS, `getdents64` + `fstatat` on Linux). A home directory with ~14 million files scans in ~5s with warm disk cache, ~18s with cold.
 
-All directories meeting `--min-size` are collected, sorted, and the top N are printed as a flat list. 
+All directories meeting `--min-size` are collected, sorted, and the top N are printed as a flat list. Hardlinks are deduplicated automatically.
 
-Access time comes from file `atime`. 
+Access time comes from the newer of file `atime` and `mtime`.
 
-Linux only.
+Supports Linux and macOS.
 
 ## Example
 

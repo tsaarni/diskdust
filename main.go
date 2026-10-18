@@ -7,9 +7,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
-	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/dustin/go-humanize"
 	"github.com/spf13/cobra"
@@ -21,19 +19,51 @@ type dirNode struct {
 	path       string
 	ownSize    int64     // size of files directly in this directory
 	ownFiles   int64     // count of files directly in this directory
-	ownTime    time.Time // newest atime of files directly in this directory
+	ownTime    time.Time // newest access/mod time of files directly in this directory
 	totalSize  int64     // ownSize + all descendants
-	newestTime time.Time // newest atime across all descendants
+	newestTime time.Time // newest access/mod time across all descendants
 	fileCount  int64     // ownFiles + all descendants
 	children   []*dirNode
 }
 
+// inodeTracker tracks hard-linked file inodes across workers using sharded maps
+// to avoid lock contention when deduplicating hardlinks.
+type inodeTracker struct {
+	shards [64]struct {
+		mu  sync.Mutex
+		set map[uint64]struct{}
+	}
+}
+
+func newInodeTracker() *inodeTracker {
+	t := &inodeTracker{}
+	for i := range t.shards {
+		t.shards[i].set = make(map[uint64]struct{})
+	}
+	return t
+}
+
+// add records ino and returns true if this is the first time seeing it.
+func (t *inodeTracker) add(ino uint64) bool {
+	// Fibonacci hashing for shard selection.
+	idx := (ino * 11400714819323198485) >> 58
+	s := &t.shards[idx]
+	s.mu.Lock()
+	_, exists := s.set[ino]
+	if !exists {
+		s.set[ino] = struct{}{}
+	}
+	s.mu.Unlock()
+	return !exists
+}
+
 var (
-	notAccessed int
-	topN        int
-	workers     int
-	minSizeStr  string
-	sortBy      string
+	notAccessed  int
+	topN         int
+	workers      int
+	minSizeStr   string
+	sortBy       string
+	apparentSize bool
 )
 
 func main() {
@@ -49,6 +79,7 @@ func main() {
 	cmd.Flags().IntVar(&workers, "workers", runtime.NumCPU(), "number of parallel workers")
 	cmd.Flags().StringVar(&minSizeStr, "min-size", "500MB", "minimum size to display (e.g. 100MB, 1GB)")
 	cmd.Flags().StringVar(&sortBy, "sort", "size", "sort order: size or accessed")
+	cmd.Flags().BoolVar(&apparentSize, "apparent-size", false, "use apparent file size instead of actual disk block usage")
 	cmd.SilenceUsage = true
 
 	if err := cmd.Execute(); err != nil {
@@ -93,7 +124,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Phase 1: walk and collect per-directory stats.
 	start := time.Now()
-	dirMap := walkAll(target, workers)
+	dirMap := walkAll(target, workers, apparentSize)
 	elapsed := time.Since(start)
 
 	// Phase 2: build tree from flat map.
@@ -110,7 +141,7 @@ func run(cmd *cobra.Command, args []string) error {
 	collect = func(n *dirNode) {
 		for _, c := range n.children {
 			if c.totalSize >= minBytes {
-				if cutoff.IsZero() || c.newestTime.Before(cutoff) {
+				if cutoff.IsZero() || (!c.newestTime.IsZero() && c.newestTime.Before(cutoff)) {
 					all = append(all, c)
 				}
 			}
@@ -127,14 +158,30 @@ func run(cmd *cobra.Command, args []string) error {
 			return all[i].totalSize > all[j].totalSize
 		}
 	})
-	matched := len(all)
 	if len(all) > topN {
 		all = all[:topN]
 	}
 
+	// Compute listed size without double-counting subdirectories whose ancestor is also in `all`.
+	listedSet := make(map[string]struct{}, len(all))
+	for _, n := range all {
+		listedSet[n.path] = struct{}{}
+	}
 	var listedSize int64
 	for _, n := range all {
-		listedSize += n.totalSize
+		hasListedAncestor := false
+		for p := filepath.Dir(n.path); len(p) >= len(target) && p != "." && p != "/"; p = filepath.Dir(p) {
+			if _, ok := listedSet[p]; ok {
+				hasListedAncestor = true
+				break
+			}
+			if p == target {
+				break
+			}
+		}
+		if !hasListedAncestor {
+			listedSize += n.totalSize
+		}
 	}
 
 	// Phase 4: print results.
@@ -142,15 +189,19 @@ func run(cmd *cobra.Command, args []string) error {
 
 	for _, n := range all {
 		rel, _ := filepath.Rel(target, n.path)
+		accessedStr := "-"
+		if !n.newestTime.IsZero() {
+			accessedStr = n.newestTime.Format("2006-01-02")
+		}
 		fmt.Printf("%9s  %10s  %9d  %s/\n",
 			humanize.IBytes(uint64(n.totalSize)),
-			n.newestTime.Format("2006-01-02"),
+			accessedStr,
 			n.fileCount, rel)
 	}
 
 	fmt.Printf("\nScanned %s files in %s directories (%s) in %s\n",
 		humanize.Comma(root.fileCount),
-		humanize.Comma(int64(matched)),
+		humanize.Comma(int64(len(dirMap))),
 		humanize.IBytes(uint64(root.totalSize)),
 		elapsed.Round(time.Millisecond))
 	fmt.Printf("Listed %d directories (%s)\n",
@@ -206,149 +257,83 @@ func propagate(n *dirNode) {
 // walkAll walks the entire directory tree and returns per-directory stats.
 // Each directory entry contains only the files directly in that directory
 // (not recursively summed — that happens in propagate).
-func walkAll(target string, numWorkers int) map[string]*dirNode {
+func walkAll(target string, numWorkers int, apparentSize bool) map[string]*dirNode {
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
 	var (
-		mu     sync.Mutex
-		result = make(map[string]*dirNode)
-		wg     sync.WaitGroup
-		ch     = make(chan string, 4096)
+		mu       sync.Mutex
+		result   = make(map[string]*dirNode, 4096)
+		wg       sync.WaitGroup
+		ch       = make(chan string, 8192)
+		inodes   = newInodeTracker()
+		workerWg sync.WaitGroup
 	)
 
-	type dirEntry struct {
-		name  string
-		isDir bool
-	}
+	worker := func() {
+		defer workerWg.Done()
 
-	readDir := func(dirPath string) ([]dirEntry, error) {
-		fd, err := syscall.Open(dirPath, syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
-		if err != nil {
-			return nil, err
-		}
-		defer syscall.Close(fd)
+		// Per-worker reusable syscall buffer and local node accumulator.
+		buf := make([]byte, scanBufSize)
+		localNodes := make([]*dirNode, 0, 512)
+		var localQueue []string
 
-		var entries []dirEntry
-		buf := make([]byte, 32768)
-
-		for {
-			n, err := syscall.Getdents(fd, buf)
-			if err != nil {
-				return entries, err
+		flush := func() {
+			if len(localNodes) == 0 {
+				return
 			}
-			if n <= 0 {
-				break
+			mu.Lock()
+			for _, n := range localNodes {
+				result[n.path] = n
+			}
+			mu.Unlock()
+			localNodes = localNodes[:0]
+		}
+
+		processOne := func(dir string) {
+			ownSize, ownFiles, newestTime, subdirs, err := scanDir(dir, buf, inodes, apparentSize)
+			if err != nil && ownFiles == 0 && len(subdirs) == 0 && dir != target {
+				return
 			}
 
-			offset := 0
-			for offset < n {
-				dirent := (*syscall.Dirent)(unsafe.Pointer(&buf[offset]))
-				nameBytes := buf[offset+nameOffset() : offset+int(dirent.Reclen)]
-				nameLen := 0
-				for nameLen < len(nameBytes) && nameBytes[nameLen] != 0 {
-					nameLen++
-				}
-				name := string(nameBytes[:nameLen])
-				offset += int(dirent.Reclen)
-
-				if name == "." || name == ".." {
-					continue
-				}
-
-				entries = append(entries, dirEntry{name: name, isDir: dirent.Type == syscall.DT_DIR})
+			localNodes = append(localNodes, &dirNode{
+				name:     filepath.Base(dir),
+				path:     dir,
+				ownSize:  ownSize,
+				ownFiles: ownFiles,
+				ownTime:  newestTime,
+			})
+			if len(localNodes) >= 512 {
+				flush()
 			}
-		}
-		return entries, nil
-	}
 
-	var processDir func(dir string, localResult map[string]*dirNode)
-
-	processDir = func(dir string, localResult map[string]*dirNode) {
-		entries, err := readDir(dir)
-		if err != nil {
-			return
-		}
-
-		node, ok := localResult[dir]
-		if !ok {
-			node = &dirNode{name: filepath.Base(dir), path: dir}
-			localResult[dir] = node
-		}
-
-		for _, entry := range entries {
-			fullPath := dir + "/" + entry.name
-
-			if entry.isDir {
-				// Ensure child dir exists in local map so tree building works.
-				if _, ok := localResult[fullPath]; !ok {
-					localResult[fullPath] = &dirNode{name: entry.name, path: fullPath}
-				}
+			for _, sub := range subdirs {
 				wg.Add(1)
 				select {
-				case ch <- fullPath:
+				case ch <- sub:
 				default:
 					wg.Done()
-					processDir(fullPath, localResult)
-				}
-				continue
-			}
-
-			var st syscall.Stat_t
-			if syscall.Lstat(fullPath, &st) != nil {
-				continue
-			}
-
-			atime := time.Unix(st.Atim.Sec, st.Atim.Nsec)
-			node.ownSize += st.Size
-			node.ownFiles++
-			if atime.After(node.ownTime) {
-				node.ownTime = atime
-			}
-		}
-	}
-
-	flushLocal := func(localResult map[string]*dirNode) {
-		if len(localResult) == 0 {
-			return
-		}
-		mu.Lock()
-		for path, ln := range localResult {
-			n, ok := result[path]
-			if !ok {
-				result[path] = &dirNode{
-					name:    ln.name,
-					path:    ln.path,
-					ownSize: ln.ownSize,
-					ownFiles: ln.ownFiles,
-					ownTime: ln.ownTime,
-				}
-			} else {
-				n.ownSize += ln.ownSize
-				n.ownFiles += ln.ownFiles
-				if ln.ownTime.After(n.ownTime) {
-					n.ownTime = ln.ownTime
+					localQueue = append(localQueue, sub)
 				}
 			}
 		}
-		mu.Unlock()
-	}
-
-	var workerWg sync.WaitGroup
-
-	worker := func() {
-		localResult := make(map[string]*dirNode)
-		flushCount := 0
 
 		for dir := range ch {
-			processDir(dir, localResult)
-			flushCount++
-			if flushCount >= 128 {
-				flushLocal(localResult)
-				localResult = make(map[string]*dirNode)
-				flushCount = 0
+			processOne(dir)
+			for len(localQueue) > 0 {
+				// Pop from end (LIFO) for bounded memory and cache locality,
+				// while opportunistically feeding idle workers via ch in processOne.
+				idx := len(localQueue) - 1
+				next := localQueue[idx]
+				localQueue[idx] = ""
+				localQueue = localQueue[:idx]
+				processOne(next)
 			}
 			wg.Done()
 		}
-		flushLocal(localResult)
-		workerWg.Done()
+
+		flush()
 	}
 
 	for i := 0; i < numWorkers; i++ {
@@ -364,9 +349,4 @@ func walkAll(target string, numWorkers int) map[string]*dirNode {
 	workerWg.Wait()
 
 	return result
-}
-
-func nameOffset() int {
-	var d syscall.Dirent
-	return int(unsafe.Offsetof(d.Name))
 }
