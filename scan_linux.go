@@ -21,10 +21,10 @@ func nameOffset() int {
 	return int(unsafe.Offsetof(d.Name))
 }
 
-func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool) (ownSize, ownFiles int64, newestTime time.Time, subdirs []string, err error) {
+func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, minFileBytes int64, exclude *excludeMatcher) (ownSize, ownFiles int64, newestTime time.Time, subdirs []string, largeFiles []fileEntry, err error) {
 	fd, err := syscall.Open(dirPath, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return 0, 0, time.Time{}, nil, err
+		return 0, 0, time.Time{}, nil, nil, err
 	}
 	defer syscall.Close(fd)
 
@@ -37,7 +37,7 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool) 
 	for {
 		n, err := syscall.Getdents(fd, buf)
 		if err != nil {
-			return ownSize, ownFiles, newestTime, subdirs, err
+			return ownSize, ownFiles, newestTime, subdirs, largeFiles, err
 		}
 		if n <= 0 {
 			break
@@ -68,12 +68,11 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool) 
 			dtype := dirent.Type
 
 			if dtype == syscall.DT_DIR {
-				name := string(nameBytes[:nameLen])
-				if dirPath == "/" {
-					subdirs = append(subdirs, "/"+name)
-				} else {
-					subdirs = append(subdirs, dirPath+"/"+name)
+				subPath := joinPath(dirPath, string(nameBytes[:nameLen]))
+				if exclude != nil && exclude.match(subPath) {
+					continue
 				}
+				subdirs = append(subdirs, subPath)
 				continue
 			}
 
@@ -107,12 +106,15 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool) 
 
 			// Handle filesystems that return DT_UNKNOWN (e.g., XFS without ftype, NFS, FUSE).
 			if dtype == syscall.DT_UNKNOWN && (st.Mode&syscall.S_IFMT) == syscall.S_IFDIR {
-				name := string(nameBytes[:nameLen])
-				if dirPath == "/" {
-					subdirs = append(subdirs, "/"+name)
-				} else {
-					subdirs = append(subdirs, dirPath+"/"+name)
+				subPath := joinPath(dirPath, string(nameBytes[:nameLen]))
+				if exclude != nil && exclude.match(subPath) {
+					continue
 				}
+				subdirs = append(subdirs, subPath)
+				continue
+			}
+
+			if exclude != nil && exclude.match(joinPath(dirPath, string(nameBytes[:nameLen]))) {
 				continue
 			}
 
@@ -123,11 +125,13 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool) 
 				}
 			}
 
+			var fileSize int64
 			if apparentSize {
-				ownSize += st.Size
+				fileSize = st.Size
 			} else {
-				ownSize += st.Blocks * 512
+				fileSize = st.Blocks * 512
 			}
+			ownSize += fileSize
 			ownFiles++
 
 			// Use the newer of atime and mtime so noatime/relatime mounts still reflect recent activity.
@@ -139,11 +143,23 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool) 
 			if sec > maxSec || (sec == maxSec && nsec > maxNsec) {
 				maxSec, maxNsec = sec, nsec
 			}
+
+			if minFileBytes > 0 && fileSize >= minFileBytes {
+				var ft time.Time
+				if sec > 0 || nsec > 0 {
+					ft = time.Unix(sec, nsec)
+				}
+				largeFiles = append(largeFiles, fileEntry{
+					path:    joinPath(dirPath, string(nameBytes[:nameLen])),
+					size:    fileSize,
+					modTime: ft,
+				})
+			}
 		}
 	}
 
 	if maxSec > 0 || maxNsec > 0 {
 		newestTime = time.Unix(maxSec, maxNsec)
 	}
-	return ownSize, ownFiles, newestTime, subdirs, nil
+	return ownSize, ownFiles, newestTime, subdirs, largeFiles, nil
 }

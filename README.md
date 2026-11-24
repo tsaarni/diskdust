@@ -23,26 +23,29 @@ diskdust [path] [flags]
 Path defaults to `$HOME`.
 
 ```bash
-diskdust                            # biggest directories
-diskdust --not-accessed 365         # only dirs not accessed in 365 days
-diskdust --sort accessed            # sort by least recently accessed
-diskdust ~/.cache --min-size 100MB  # focus on a specific directory
+diskdust                                # biggest directories and files
+diskdust --sort dust                    # rank by size and age combined
+diskdust --not-accessed 365             # only entries not accessed in 365 days
+diskdust --sort accessed                # sort by least recently accessed
+diskdust --exclude Downloads/archive    # skip matching paths during the walk
+diskdust ~/.cache --min-size 100MB      # focus on a specific directory
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--not-accessed` | 0 | Only show directories not accessed in this many days. 0 = show all. |
-| `--min-size` | 500MB | Hide directories smaller than this. Accepts MB, GB. |
-| `--sort` | size | Sort by `size` or `accessed` (largest or least recently accessed first). |
+| `--not-accessed` | 0 | Only show entries not accessed in this many days. 0 = show all. |
+| `--min-size` | 500MB | Hide entries smaller than this. Accepts MB, GB. |
+| `--sort` | size | Sort by `size`, `accessed`, or `dust` (composite size × age score). |
 | `--top` | 40 | Number of results to show. |
+| `--exclude` | | Exclude paths matching pattern (repeatable, e.g. `Downloads/foo`, `.git`, `*.dmg`). |
 | `--workers` | CPU count | Parallel workers for the filesystem walk. |
 | `--apparent-size` | false | Use apparent file size instead of actual disk block usage. |
 
 ## How it works
 
-Walks the filesystem in parallel using raw OS syscalls (`getattrlistbulk` on macOS, `getdents64` + `fstatat` on Linux). A home directory with ~14 million files scans in ~5s with warm disk cache, ~18s with cold.
+Walks the filesystem in parallel using raw OS syscalls (`getattrlistbulk` on macOS, `getdents64` + `fstatat` on Linux). A home directory with ~14 million files scans in ~5s with warm disk cache, ~18s with cold. Live scan progress is shown on `stderr` when attached to a terminal.
 
-All directories meeting `--min-size` are collected, sorted, and the top N are printed as a flat list. Hardlinks are deduplicated automatically.
+All directories and individual files meeting `--min-size` are collected, redundant ancestor directories (where a single qualifying child accounts for ≥95% of the parent's size) are collapsed automatically, and the top N are printed as a flat list. Hardlinks are deduplicated automatically.
 
 Access time comes from the newer of file `atime` and `mtime`.
 

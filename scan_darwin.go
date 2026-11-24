@@ -94,10 +94,10 @@ var bulkAttrList = attrList{
 		attrFileAllocSize,
 }
 
-func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool) (ownSize, ownFiles int64, newestTime time.Time, subdirs []string, err error) {
+func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, minFileBytes int64, exclude *excludeMatcher) (ownSize, ownFiles int64, newestTime time.Time, subdirs []string, largeFiles []fileEntry, err error) {
 	fd, err := syscall.Open(dirPath, syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if err != nil {
-		return 0, 0, time.Time{}, nil, err
+		return 0, 0, time.Time{}, nil, nil, err
 	}
 	defer syscall.Close(fd)
 
@@ -115,7 +115,7 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool) 
 			0,
 		)
 		if errno != 0 {
-			return ownSize, ownFiles, newestTime, subdirs, errno
+			return ownSize, ownFiles, newestTime, subdirs, largeFiles, errno
 		}
 		count := int(r1)
 		if count <= 0 {
@@ -206,11 +206,15 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool) 
 				if flags&sfFirmlink != 0 {
 					continue
 				}
-				if dirPath == "/" {
-					subdirs = append(subdirs, "/"+name)
-				} else {
-					subdirs = append(subdirs, dirPath+"/"+name)
+				subPath := joinPath(dirPath, name)
+				if exclude != nil && exclude.match(subPath) {
+					continue
 				}
+				subdirs = append(subdirs, subPath)
+				continue
+			}
+
+			if exclude != nil && exclude.match(joinPath(dirPath, name)) {
 				continue
 			}
 
@@ -239,11 +243,13 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool) 
 				}
 			}
 
+			var fileSize int64
 			if apparentSize {
-				ownSize += totalSize
+				fileSize = totalSize
 			} else {
-				ownSize += allocSize
+				fileSize = allocSize
 			}
+			ownSize += fileSize
 			ownFiles++
 
 			// Use the newer of atime and mtime (handles noatime/relatime mounts accurately).
@@ -254,11 +260,23 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool) 
 			if sec > maxSec || (sec == maxSec && nsec > maxNsec) {
 				maxSec, maxNsec = sec, nsec
 			}
+
+			if minFileBytes > 0 && fileSize >= minFileBytes {
+				var ft time.Time
+				if sec > 0 || nsec > 0 {
+					ft = time.Unix(sec, nsec)
+				}
+				largeFiles = append(largeFiles, fileEntry{
+					path:    joinPath(dirPath, name),
+					size:    fileSize,
+					modTime: ft,
+				})
+			}
 		}
 	}
 
 	if maxSec > 0 || maxNsec > 0 {
 		newestTime = time.Unix(maxSec, maxNsec)
 	}
-	return ownSize, ownFiles, newestTime, subdirs, nil
+	return ownSize, ownFiles, newestTime, subdirs, largeFiles, nil
 }
