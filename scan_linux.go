@@ -21,10 +21,10 @@ func nameOffset() int {
 	return int(unsafe.Offsetof(d.Name))
 }
 
-func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, minFileBytes int64, exclude *excludeMatcher) (ownSize, ownFiles int64, newestTime time.Time, subdirs []string, largeFiles []fileEntry, err error) {
+func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, minFileBytes int64, exclude *excludeMatcher) (ownSize, ownFiles int64, newestTime time.Time, subdirs, emptyDirs []string, largeFiles []fileEntry, err error) {
 	fd, err := syscall.Open(dirPath, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return 0, 0, time.Time{}, nil, nil, err
+		return 0, 0, time.Time{}, nil, nil, nil, err
 	}
 	defer syscall.Close(fd)
 
@@ -37,7 +37,7 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, 
 	for {
 		n, err := syscall.Getdents(fd, buf)
 		if err != nil {
-			return ownSize, ownFiles, newestTime, subdirs, largeFiles, err
+			return ownSize, ownFiles, newestTime, subdirs, nil, largeFiles, err
 		}
 		if n <= 0 {
 			break
@@ -161,5 +161,5 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, 
 	if maxSec > 0 || maxNsec > 0 {
 		newestTime = time.Unix(maxSec, maxNsec)
 	}
-	return ownSize, ownFiles, newestTime, subdirs, largeFiles, nil
+	return ownSize, ownFiles, newestTime, subdirs, nil, largeFiles, nil
 }

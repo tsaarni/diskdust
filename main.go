@@ -562,8 +562,8 @@ func walkAll(target string, numWorkers int, apparentSize bool, minFileBytes int6
 		}
 
 		processOne := func(dir string) {
-			ownSize, ownFiles, newestTime, subdirs, largeFiles, err := scanDir(dir, buf, inodes, apparentSize, minFileBytes, exclude)
-			if err != nil && ownFiles == 0 && len(subdirs) == 0 && dir != target {
+			ownSize, ownFiles, newestTime, subdirs, emptyDirs, largeFiles, err := scanDir(dir, buf, inodes, apparentSize, minFileBytes, exclude)
+			if err != nil && ownFiles == 0 && len(subdirs) == 0 && len(emptyDirs) == 0 && dir != target {
 				return
 			}
 
@@ -575,8 +575,14 @@ func walkAll(target string, numWorkers int, apparentSize bool, minFileBytes int6
 				ownTime:    newestTime,
 				largeFiles: largeFiles,
 			})
+			for _, empty := range emptyDirs {
+				localNodes = append(localNodes, &dirNode{
+					name: filepath.Base(empty),
+					path: empty,
+				})
+			}
 			if progress != nil {
-				pDirs++
+				pDirs += 1 + int64(len(emptyDirs))
 				pFiles += ownFiles
 				pBytes += ownSize
 				if pDirs >= 64 {

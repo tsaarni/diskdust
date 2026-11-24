@@ -56,6 +56,7 @@ const (
 	attrCmnReturnedAttrs = 0x80000000
 
 	// Directory attributes (dirattr)
+	attrDirEntryCount  = 0x00000002
 	attrDirMountStatus = 0x00000004
 
 	// File attributes (fileattr)
@@ -65,6 +66,7 @@ const (
 
 	// Options for getattrlistbulk
 	fsoptNoFollow       = 0x00000001
+	fsoptNoInMemUpdate  = 0x00000002
 	fsoptPackInvalAttrs = 0x00000008
 
 	// Object types (enum vtype in <sys/vnode.h>)
@@ -79,6 +81,21 @@ const (
 // 128 KiB reduces the number of syscalls on large directories significantly.
 const scanBufSize = 128 * 1024
 
+// macOS note: walking trees with more directories than kern.maxvnodes (~250k)
+// can fill the kernel vnode cache and trigger global vnlru reclamation pauses
+// (5-10s stalls across all workers).
+//
+// How to observe/verify:
+//   - Run `sysctl kern.maxvnodes kern.num_vnodes` during or right after a scan;
+//     when stalled, kern.num_vnodes is pinned at kern.maxvnodes (100% full).
+//   - All workers (and even unrelated commands like `df`) stall simultaneously
+//     for the same ~5-10s wall-clock window and resume together.
+//
+// To minimize vnode pressure and lock contention:
+//   - attrDirEntryCount lets us skip open()ing empty directories (entryCount == 0)
+//     so they never allocate a vnode.
+//   - fsoptNoInMemUpdate reads attributes straight from the APFS catalog without
+//     contending on in-memory vnode locks.
 var bulkAttrList = attrList{
 	bitmapcount: attrBitMapCount,
 	commonattr: attrCmnReturnedAttrs |
@@ -89,15 +106,16 @@ var bulkAttrList = attrList{
 		attrCmnAccTime |
 		attrCmnFlags |
 		attrCmnFileID,
+	dirattr: attrDirEntryCount,
 	fileattr: attrFileLinkCount |
 		attrFileTotalSize |
 		attrFileAllocSize,
 }
 
-func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, minFileBytes int64, exclude *excludeMatcher) (ownSize, ownFiles int64, newestTime time.Time, subdirs []string, largeFiles []fileEntry, err error) {
+func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, minFileBytes int64, exclude *excludeMatcher) (ownSize, ownFiles int64, newestTime time.Time, subdirs, emptyDirs []string, largeFiles []fileEntry, err error) {
 	fd, err := syscall.Open(dirPath, syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if err != nil {
-		return 0, 0, time.Time{}, nil, nil, err
+		return 0, 0, time.Time{}, nil, nil, nil, err
 	}
 	defer syscall.Close(fd)
 
@@ -111,11 +129,11 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, 
 			uintptr(unsafe.Pointer(&al)),
 			uintptr(unsafe.Pointer(&buf[0])),
 			uintptr(len(buf)),
-			fsoptNoFollow,
+			fsoptNoFollow|fsoptNoInMemUpdate,
 			0,
 		)
 		if errno != 0 {
-			return ownSize, ownFiles, newestTime, subdirs, largeFiles, errno
+			return ownSize, ownFiles, newestTime, subdirs, emptyDirs, largeFiles, errno
 		}
 		count := int(r1)
 		if count <= 0 {
@@ -201,6 +219,14 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, 
 				pos += 8
 			}
 
+			var hasEntryCount bool
+			var entryCount uint32
+			if returned.dirattr&attrDirEntryCount != 0 {
+				entryCount = *(*uint32)(unsafe.Pointer(&buf[pos]))
+				pos += 4
+				hasEntryCount = true
+			}
+
 			if objType == vtypeDir {
 				// Skip firmlinks (e.g., /System/Volumes/Data firmlinks) to avoid loops or duplicate traversal.
 				if flags&sfFirmlink != 0 {
@@ -210,7 +236,11 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, 
 				if exclude != nil && exclude.match(subPath) {
 					continue
 				}
-				subdirs = append(subdirs, subPath)
+				if hasEntryCount && entryCount == 0 {
+					emptyDirs = append(emptyDirs, subPath)
+				} else {
+					subdirs = append(subdirs, subPath)
+				}
 				continue
 			}
 
@@ -278,5 +308,5 @@ func scanDir(dirPath string, buf []byte, seen *inodeTracker, apparentSize bool, 
 	if maxSec > 0 || maxNsec > 0 {
 		newestTime = time.Unix(maxSec, maxNsec)
 	}
-	return ownSize, ownFiles, newestTime, subdirs, largeFiles, nil
+	return ownSize, ownFiles, newestTime, subdirs, emptyDirs, largeFiles, nil
 }
